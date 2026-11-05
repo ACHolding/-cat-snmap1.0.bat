@@ -124,12 +124,17 @@ set "PS=%TEMP%\catnmap_%RANDOM%%RANDOM%.ps1"
 >>"%PS%" echo )
 >>"%PS%" echo $ErrorActionPreference = 'Stop'
 >>"%PS%" echo try {
->>"%PS%" echo   $Target = ([string]$env:CATNMAP_TARGET).Trim()
+>>"%PS%" echo   $Target = ([string]$env:CATNMAP_TARGET) -replace '\s+', ''
 >>"%PS%" echo   $PortSpec = [string]$env:CATNMAP_PORTS
 >>"%PS%" echo   if ($TimeoutMs -lt 1) { throw 'timeout must be at least 1 ms' }
 >>"%PS%" echo   if ($Jobs -lt 1 -or $Jobs -gt 512) { throw 'jobs must be 1-512' }
 >>"%PS%" echo   if ($Target.Contains(':')) { $Target = $Target.Split(':')[0] }
 >>"%PS%" echo   if ($Target.Length -eq 0) { throw 'target is empty' }
+>>"%PS%" echo.
+>>"%PS%" echo   $PortSpec = $PortSpec -replace '\s+', ','
+>>"%PS%" echo   while ($PortSpec.Contains(',,')) { $PortSpec = $PortSpec.Replace(',,', ',') }
+>>"%PS%" echo   $PortSpec = $PortSpec.Trim(',')
+>>"%PS%" echo   if ($PortSpec.Length -eq 0) { throw 'no ports given' }
 >>"%PS%" echo.
 >>"%PS%" echo   $ports = New-Object 'System.Collections.Generic.SortedSet[int]'
 >>"%PS%" echo   foreach ($part in $PortSpec.Split(',')) {
@@ -220,7 +225,7 @@ set "PS=%TEMP%\catnmap_%RANDOM%%RANDOM%.ps1"
 >>"%PS%" echo         $pending.RemoveAt($i)
 >>"%PS%" echo       }
 >>"%PS%" echo     }
->>"%PS%" echo     if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 2 }
+>>"%PS%" echo     if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 5 }
 >>"%PS%" echo   }
 >>"%PS%" echo   $sw.Stop()
 >>"%PS%" echo.
@@ -263,9 +268,9 @@ if not defined TARGET (
   echo error: target required, use -h TARGET
   exit /b 1
 )
-echo(!TARGET!| findstr /r /x /c:"[A-Za-z0-9.:-][A-Za-z0-9.:-]*" >nul
+echo(!TARGET!| findstr /r /x /c:"[A-Za-z0-9.: -][A-Za-z0-9.: -]*" >nul
 if errorlevel 1 (
-  echo error: target may contain only letters, digits, dots, colons and dashes - no http:// and no path
+  echo error: target may contain only letters, digits, dots, colons, dashes and spaces - no http:// and no path
   exit /b 1
 )
 if defined PORTS (
@@ -288,7 +293,7 @@ if errorlevel 1 (
   echo error: concurrency must be a whole number
   exit /b 1
 )
-rem Strip leading zeros so 08 is not read as octal, and cap the length so set /a and if cannot overflow.
+rem Strip leading zeros so 08 is not read as octal, and cap the length so if cannot overflow.
 call :normnum TMO
 call :normnum JOBS
 if not "!TMO:~9!"=="" (
