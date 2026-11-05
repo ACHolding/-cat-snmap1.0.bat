@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-title cat's nmap 0.1.2
-set "VERSION=0.1.2"
+title cat's nmap 0.1.1
+set "VERSION=0.1.1"
 set "TARGET="
 set "PORTS="
 set "TMO=400"
