@@ -10,15 +10,17 @@ set "SHOWCLOSED="
 set "KEEP="
 set "PAUSE_AT_END="
 
-rem Detect a double-click launch. Delayed expansion keeps special characters inert.
-echo(!CMDCMDLINE!| find /i "/c" >nul && set "PAUSE_AT_END=1"
+rem Detect a double-click launch (cmd /c). No pipe here: a piped child has its own CMDCMDLINE that always contains /c.
+set "CL=!CMDCMDLINE!"
+if /i not "!CL: /c =!"=="!CL!" set "PAUSE_AT_END=1"
 
-if /i "%~1"=="--help" goto :help
-if /i "%~1"=="-?" goto :help
 if "%~1"=="" goto :interactive
 
 :parse
 if "%~1"=="" goto :ready
+if /i "%~1"=="--help" goto :help
+if /i "%~1"=="-?" goto :help
+if /i "%~1"=="/?" goto :help
 if /i "%~1"=="-h" (
   if "%~2"=="" ( echo error: -h needs a value & goto :bad_input )
   set "TARGET=%~2"
@@ -54,17 +56,21 @@ if /i "%~1"=="-a" (
 )
 if /i "%~1"=="--keep" (
   set "KEEP=1"
-  set "PAUSE_AT_END=1"
   shift
   goto :parse
 )
-if "!TARGET!"=="" (
-  set "TARGET=%~1"
-  shift
-  goto :parse
+set "ARG=%~1"
+if "!ARG:~0,1!"=="-" (
+  echo error: unknown option !ARG!
+  goto :bad_input
 )
-echo error: unexpected argument
-goto :bad_input
+if defined TARGET (
+  echo error: unexpected argument !ARG!
+  goto :bad_input
+)
+set "TARGET=!ARG!"
+shift
+goto :parse
 
 :interactive
 echo cat's nmap %VERSION%
@@ -86,10 +92,9 @@ echo.
 call :validate
 if errorlevel 1 goto :bad_input
 echo   target      : !TARGET!
-if defined PORTS echo   ports       : !PORTS!
-if not defined PORTS echo   ports       : common list
-echo   timeout     : !TMO! ms
-echo   concurrency : !JOBS!
+if defined PORTS (echo   ports       : !PORTS!) else (echo   ports       : common list)
+echo   timeout     : !TMO_N! ms
+echo   concurrency : !JOBS_N!
 echo.
 set "ANS="
 set /p "ANS=Start scan? (Y/n): "
@@ -165,68 +170,76 @@ set "PS=%TEMP%\catnmap_%RANDOM%%RANDOM%.ps1"
 >>"%PS%" echo     5900='vnc'; 6379='redis'; 8080='http-proxy'; 8443='https-alt'
 >>"%PS%" echo     9200='elasticsearch'; 27017='mongodb'
 >>"%PS%" echo   }
->>"%PS%" echo   function Svc($p) { if ($svc.ContainsKey($p)) { $svc[$p] } else { 'unknown' } }
+>>"%PS%" echo   function Get-Svc($n) { if ($svc.ContainsKey($n)) { $svc[$n] } else { 'unknown' } }
 >>"%PS%" echo.
->>"%PS%" echo   $sb = {
->>"%PS%" echo     param($ip, $port, $timeout)
->>"%PS%" echo     $sock = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp)
->>"%PS%" echo     try {
->>"%PS%" echo       $ar = $sock.BeginConnect((New-Object System.Net.IPEndPoint($ip, $port)), $null, $null)
->>"%PS%" echo       if ($ar.AsyncWaitHandle.WaitOne($timeout)) {
->>"%PS%" echo         $sock.EndConnect($ar)
->>"%PS%" echo         return 'open'
+>>"%PS%" echo   # refused = closed, anything else that fails = filtered, success = open
+>>"%PS%" echo   function Get-State($t) {
+>>"%PS%" echo     if ($t.IsFaulted) {
+>>"%PS%" echo       $e = $t.Exception
+>>"%PS%" echo       while ($null -ne $e.InnerException) { $e = $e.InnerException }
+>>"%PS%" echo       if ($e -is [System.Net.Sockets.SocketException]) {
+>>"%PS%" echo         if ($e.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused) { return 'closed' }
 >>"%PS%" echo       }
 >>"%PS%" echo       return 'filtered'
->>"%PS%" echo     } catch {
->>"%PS%" echo       return 'closed'
->>"%PS%" echo     } finally {
->>"%PS%" echo       $sock.Close()
 >>"%PS%" echo     }
+>>"%PS%" echo     if ($t.IsCanceled) { return 'filtered' }
+>>"%PS%" echo     return 'open'
 >>"%PS%" echo   }
+>>"%PS%" echo.
+>>"%PS%" echo   $queue = New-Object 'System.Collections.Generic.Queue[int]'
+>>"%PS%" echo   foreach ($n in $ports) { $queue.Enqueue($n) }
+>>"%PS%" echo   $pending = New-Object 'System.Collections.Generic.List[object]'
+>>"%PS%" echo   $open = New-Object 'System.Collections.Generic.List[int]'
+>>"%PS%" echo   $closed = New-Object 'System.Collections.Generic.List[int]'
+>>"%PS%" echo   $filtered = New-Object 'System.Collections.Generic.List[int]'
 >>"%PS%" echo.
 >>"%PS%" echo   $sw = [Diagnostics.Stopwatch]::StartNew()
->>"%PS%" echo   $pool = [runspacefactory]::CreateRunspacePool(1, $Jobs)
->>"%PS%" echo   $pool.Open()
->>"%PS%" echo   $queued = @()
->>"%PS%" echo   foreach ($p in @($ports)) {
->>"%PS%" echo     $ps = [powershell]::Create()
->>"%PS%" echo     $ps.RunspacePool = $pool
->>"%PS%" echo     $null = $ps.AddScript($sb).AddArgument($ip).AddArgument($p).AddArgument($TimeoutMs)
->>"%PS%" echo     $queued += @{ PS = $ps; H = $ps.BeginInvoke(); Port = $p }
+>>"%PS%" echo   while ($queue.Count -gt 0 -or $pending.Count -gt 0) {
+>>"%PS%" echo     while ($queue.Count -gt 0 -and $pending.Count -lt $Jobs) {
+>>"%PS%" echo       $n = $queue.Dequeue()
+>>"%PS%" echo       $c = New-Object System.Net.Sockets.TcpClient([System.Net.Sockets.AddressFamily]::InterNetwork)
+>>"%PS%" echo       try {
+>>"%PS%" echo         $t = $c.ConnectAsync($ip, $n)
+>>"%PS%" echo         $pending.Add(@{ C = $c; T = $t; Port = $n; Born = $sw.ElapsedMilliseconds })
+>>"%PS%" echo       } catch {
+>>"%PS%" echo         $c.Close()
+>>"%PS%" echo         $filtered.Add($n)
+>>"%PS%" echo       }
+>>"%PS%" echo     }
+>>"%PS%" echo     $now = $sw.ElapsedMilliseconds
+>>"%PS%" echo     for ($i = $pending.Count - 1; $i -ge 0; $i--) {
+>>"%PS%" echo       $j = $pending[$i]
+>>"%PS%" echo       $state = $null
+>>"%PS%" echo       if ($j.T.IsCompleted) { $state = Get-State $j.T }
+>>"%PS%" echo       elseif (($now - $j.Born) -ge $TimeoutMs) { $state = 'filtered' }
+>>"%PS%" echo       if ($null -ne $state) {
+>>"%PS%" echo         $j.C.Close()
+>>"%PS%" echo         if ($state -eq 'open') { $open.Add($j.Port) }
+>>"%PS%" echo         elseif ($state -eq 'closed') { $closed.Add($j.Port) }
+>>"%PS%" echo         else { $filtered.Add($j.Port) }
+>>"%PS%" echo         $pending.RemoveAt($i)
+>>"%PS%" echo       }
+>>"%PS%" echo     }
+>>"%PS%" echo     if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 2 }
 >>"%PS%" echo   }
->>"%PS%" echo.
->>"%PS%" echo   $open = @()
->>"%PS%" echo   $closed = @()
->>"%PS%" echo   $filtered = @()
->>"%PS%" echo   foreach ($j in $queued) {
->>"%PS%" echo     $st = 'closed'
->>"%PS%" echo     try { $st = [string]($j.PS.EndInvoke($j.H)[0]) } catch { $st = 'closed' }
->>"%PS%" echo     $j.PS.Dispose()
->>"%PS%" echo     if ($st -eq 'open') { $open += $j.Port }
->>"%PS%" echo     elseif ($st -eq 'filtered') { $filtered += $j.Port }
->>"%PS%" echo     else { $closed += $j.Port }
->>"%PS%" echo   }
->>"%PS%" echo   $pool.Close()
 >>"%PS%" echo   $sw.Stop()
 >>"%PS%" echo.
+>>"%PS%" echo   $open.Sort(); $closed.Sort(); $filtered.Sort()
 >>"%PS%" echo   Write-Host ("Nmap scan report for {0} ({1})" -f $Target, $ip)
->>"%PS%" echo   if ($open.Count -gt 0 -or $closed.Count -gt 0) { Write-Host 'Host is up.' } else { Write-Host 'Host seems down.' }
+>>"%PS%" echo   if ($open.Count -gt 0 -or $closed.Count -gt 0) { Write-Host 'Host is up.' } else { Write-Host 'Host seems down, or every port is filtered.' }
 >>"%PS%" echo   $hidden = $closed.Count + $filtered.Count
 >>"%PS%" echo   if (-not $ShowClosed -and $hidden -gt 0) { Write-Host ("Not shown: {0} closed or filtered tcp ports" -f $hidden) }
 >>"%PS%" echo   if ($open.Count -gt 0 -or ($ShowClosed -and $hidden -gt 0)) {
 >>"%PS%" echo     Write-Host ''
 >>"%PS%" echo     Write-Host ("{0,-9}{1,-9}{2}" -f 'PORT', 'STATE', 'SERVICE')
->>"%PS%" echo     $o = @($open); [Array]::Sort($o)
->>"%PS%" echo     foreach ($p in $o) { Write-Host ("{0,-9}{1,-9}{2}" -f ("$p/tcp"), 'open', (Svc $p)) }
+>>"%PS%" echo     foreach ($n in $open) { Write-Host ("{0,-9}{1,-9}{2}" -f ("$n/tcp"), 'open', (Get-Svc $n)) }
 >>"%PS%" echo     if ($ShowClosed) {
->>"%PS%" echo       $c = @($closed); [Array]::Sort($c)
->>"%PS%" echo       foreach ($p in $c) { Write-Host ("{0,-9}{1,-9}{2}" -f ("$p/tcp"), 'closed', (Svc $p)) }
->>"%PS%" echo       $f = @($filtered); [Array]::Sort($f)
->>"%PS%" echo       foreach ($p in $f) { Write-Host ("{0,-9}{1,-9}{2}" -f ("$p/tcp"), 'filtered', (Svc $p)) }
+>>"%PS%" echo       foreach ($n in $closed) { Write-Host ("{0,-9}{1,-9}{2}" -f ("$n/tcp"), 'closed', (Get-Svc $n)) }
+>>"%PS%" echo       foreach ($n in $filtered) { Write-Host ("{0,-9}{1,-9}{2}" -f ("$n/tcp"), 'filtered', (Get-Svc $n)) }
 >>"%PS%" echo     }
 >>"%PS%" echo   }
 >>"%PS%" echo   Write-Host ''
->>"%PS%" echo   Write-Host ("Nmap done: 1 IP address (1 host up) scanned in {0} seconds" -f $sw.Elapsed.TotalSeconds.ToString('0.00'))
+>>"%PS%" echo   Write-Host ("Nmap done: 1 IP address scanned in {0} seconds" -f $sw.Elapsed.TotalSeconds.ToString('0.00'))
 >>"%PS%" echo } catch {
 >>"%PS%" echo   Write-Host ("error: {0}" -f $_.Exception.Message)
 >>"%PS%" echo   exit 2
@@ -247,31 +260,47 @@ rem Every value is checked against a whitelist before it is echoed or used.
 rem Values are read through delayed expansion, so ampersands, pipes and redirects in them cannot run commands.
 :validate
 if not defined TARGET (
-  echo error: target required -h
+  echo error: target required, use -h TARGET
   exit /b 1
 )
-echo(!TARGET!| findstr /r /x "[A-Za-z0-9.:-][A-Za-z0-9.:-]*" >nul
+echo(!TARGET!| findstr /r /x /c:"[A-Za-z0-9.:-][A-Za-z0-9.:-]*" >nul
 if errorlevel 1 (
-  echo error: target may contain only letters, digits, dots, colons and dashes
+  echo error: target may contain only letters, digits, dots, colons and dashes - no http:// and no path
   exit /b 1
 )
-if defined PORTS echo(!PORTS!| findstr /r /x "[-0-9, ][-0-9, ]*" >nul
-if defined PORTS if errorlevel 1 (
-  echo error: ports may contain only digits, commas, dashes and spaces
-  exit /b 1
+if defined PORTS (
+  rem Strip every allowed character; anything left over is illegal.
+  rem findstr cannot be used here: a space inside its pattern splits it into separate patterns.
+  set "CHK=!PORTS!"
+  for %%C in (0 1 2 3 4 5 6 7 8 9 "," "-" " ") do set "CHK=!CHK:%%~C=!"
+  if defined CHK (
+    echo error: ports may contain only digits, commas, dashes and spaces
+    exit /b 1
+  )
 )
-echo(!TMO!| findstr /r /x "[0-9][0-9]*" >nul
+echo(!TMO!| findstr /r /x /c:"[0-9][0-9]*" >nul
 if errorlevel 1 (
   echo error: timeout must be a whole number of milliseconds
   exit /b 1
 )
-echo(!JOBS!| findstr /r /x "[0-9][0-9]*" >nul
+echo(!JOBS!| findstr /r /x /c:"[0-9][0-9]*" >nul
 if errorlevel 1 (
   echo error: concurrency must be a whole number
   exit /b 1
 )
-set /a "TMO_N=!TMO!" 2>nul
-set /a "JOBS_N=!JOBS!" 2>nul
+rem Strip leading zeros so 08 is not read as octal, and cap the length so set /a and if cannot overflow.
+call :normnum TMO
+call :normnum JOBS
+if not "!TMO:~9!"=="" (
+  echo error: timeout is too large
+  exit /b 1
+)
+if not "!JOBS:~9!"=="" (
+  echo error: concurrency must be 1-512
+  exit /b 1
+)
+set "TMO_N=!TMO!"
+set "JOBS_N=!JOBS!"
 if !TMO_N! LSS 1 (
   echo error: timeout must be at least 1 ms
   exit /b 1
@@ -286,6 +315,13 @@ if !JOBS_N! GTR 512 (
 )
 exit /b 0
 
+:normnum
+if not "!%1:~1!"=="" if "!%1:~0,1!"=="0" (
+  set "%1=!%1:~1!"
+  goto :normnum
+)
+exit /b 0
+
 :bad_input
 if defined PAUSE_AT_END pause
 exit /b 2
@@ -293,7 +329,7 @@ exit /b 2
 :help
 echo cat's nmap %VERSION%
 echo.
-echo usage: nmap.bat [-h TARGET] [-p PORTS] [-t MS] [-c N] [-a] [--keep]
+echo usage: %~nx0 [-h TARGET] [-p PORTS] [-t MS] [-c N] [-a] [--keep]
 echo.
 echo Run with no arguments for interactive prompts.
 echo.
@@ -304,6 +340,6 @@ echo   -c N        parallel connections, 1-512 (default 64)
 echo   -a          also list closed and filtered ports
 echo   --keep      keep the generated .ps1 and print its path
 echo.
-echo example: nmap.bat -h 127.0.0.1 -p 22,80,8000-8010 -a
+echo example: %~nx0 -h 127.0.0.1 -p 22,80,8000-8010 -a
 if defined PAUSE_AT_END pause
 exit /b 0
